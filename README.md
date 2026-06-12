@@ -7,24 +7,89 @@ The fork keeps the action generic, but adds snapshot stream keys and path-scoped
 ## Usage
 
 ```yaml
-- name: Restore build-state snapshot
-  id: snapshot
-  uses: ./.github/actions/snapshot
-  with:
-    path: /mnt/build-state
-    key: example-build-release-arm64
-    volume_size: 10
-    save: auto
-    save-if: git-paths-changed
-    save-policy-name: changed-source
-    save-policy-version: v1
-    git-paths: |
-      app/Cargo.lock
-      app/Cargo.toml
-      app/.cargo/**
-      app/bin/**
-      app/src/**
-      app/lib/**
+jobs:
+  cargo-build:
+    runs-on:
+      - runs-on=${{ github.run_id }}
+      - family=m7i
+      - image=ubuntu24-full-x64
+
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo build-state snapshot
+        id: cargo-snapshot
+        uses: your-org/snapshot@v1
+        with:
+          path: /mnt/cargo-build-state
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-release
+          volume_size: 20
+          save: auto
+          save-if: git-paths-changed
+          save-policy-name: cargo-build-inputs
+          save-policy-version: v1
+          save-marker-file: /mnt/cargo-build-state/.runs-on-snapshot/save-marker
+          git-repository: /mnt/cargo-build-state/workspace
+          git-head: ${{ github.sha }}
+          git-paths: |
+            Cargo.lock
+            Cargo.toml
+            .cargo/**
+            build.rs
+            crates/**
+            src/**
+
+      - name: Checkout source into snapshot workspace
+        shell: bash
+        env:
+          SNAPSHOT_WORKSPACE: /mnt/cargo-build-state/workspace
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$SNAPSHOT_WORKSPACE"
+          git config --global --add safe.directory "$SNAPSHOT_WORKSPACE"
+          cd "$SNAPSHOT_WORKSPACE"
+
+          if [ ! -d .git ]; then
+            git init .
+            git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          else
+            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          if [ "${GITHUB_REF#refs/heads/}" != "$GITHUB_REF" ]; then
+            fetch_ref="+${GITHUB_REF}:refs/remotes/origin/${GITHUB_REF_NAME}"
+          else
+            fetch_ref="$GITHUB_REF"
+          fi
+
+          git -c "http.https://github.com/.extraheader=$auth_header" fetch --force --prune --no-tags origin "$fetch_ref"
+
+          current_head="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+          if [ "$current_head" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "HEAD already matches $GITHUB_SHA; skipping checkout to preserve file mtimes."
+            exit 0
+          fi
+
+          git -c advice.detachedHead=false checkout --detach --force "$GITHUB_SHA"
+
+      - name: Build with Cargo state on snapshot volume
+        shell: bash
+        env:
+          SNAPSHOT_ROOT: /mnt/cargo-build-state
+          CARGO_HOME: /mnt/cargo-build-state/cargo-home
+          CARGO_TARGET_DIR: /mnt/cargo-build-state/workspace/target
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_HOME"
+          cd /mnt/cargo-build-state/workspace
+          cargo build --release --locked
+
+          mkdir -p "$SNAPSHOT_ROOT/.runs-on-snapshot"
+          printf 'save=true\n' > "$SNAPSHOT_ROOT/.runs-on-snapshot/save-marker"
 ```
 
 ## Inputs
