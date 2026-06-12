@@ -11,6 +11,7 @@ jobs:
   cargo-build:
     runs-on:
       - runs-on=${{ github.run_id }}
+      - cpu=16
       - family=m8azn
       - image=ubuntu24-full-x64
 
