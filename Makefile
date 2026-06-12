@@ -17,18 +17,18 @@ COMMAND := "."
 js:
 	rm -f index.js post.js
 	echo 'package main; import ("os"; "text/template"); func main() { tmpl, _ := template.ParseFiles("index.template.js"); tmpl.Execute(os.Stdout, map[string]string{"Args": ""}) }' > temp.go && go run temp.go > index.js && rm temp.go
-	echo 'package main; import ("os"; "text/template"); func main() { tmpl, _ := template.ParseFiles("index.template.js"); tmpl.Execute(os.Stdout, map[string]string{"Args": "--post"}) }' > temp.go && go run temp.go > post.js && rm temp.go
+	echo 'package main; import ("os"; "text/template"); func main() { tmpl, _ := template.ParseFiles("index.template.js"); tmpl.Execute(os.Stdout, map[string]string{"Args": "\"--post\""}) }' > temp.go && go run temp.go > post.js && rm temp.go
 
 .PHONY: main-linux-amd64
 main-linux-amd64: _require-upx
 	rm -f main-linux-amd64-*
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -installsuffix static -o "main-linux-amd64" $(COMMAND)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -installsuffix static -o "main-linux-amd64" $(COMMAND)
 	upx -q -9 "main-linux-amd64"
 
 .PHONY: main-linux-arm64
 main-linux-arm64: _require-upx
 	rm -f main-linux-arm64-*
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -installsuffix static -o "main-linux-arm64" $(COMMAND)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -installsuffix static -o "main-linux-arm64" $(COMMAND)
 	upx -q -9 "main-linux-arm64"
 
 .PHONY: build

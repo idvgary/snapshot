@@ -4,27 +4,37 @@ runs:
   using: 'node24'
   main: 'index.js'
   post: 'post.js'
-  # required, otherwise it could snapshot directories even if previous steps failed or were interrupted, which could lead to corrupted snapshots
-  post-if: "success()"
+  # Run post cleanup even when later steps fail. Snapshot creation can be gated with save-marker-file.
+  post-if: "always()"
 
 inputs:
   path:
     description: 'Path to the directory to snapshot. Must be an absolute path.'
     required: true
+  key:
+    description: 'Snapshot stream identity. Use distinct keys for independent matrix jobs or workloads.'
+    required: true
+  restore-keys:
+    description: 'Optional newline-delimited fallback keys to try after the primary key.'
+    required: false
+  default-branch-fallback:
+    description: 'Try the repository default branch after current-branch lookups miss.'
+    required: false
+    default: 'true'
   version:
-    description: 'Version of the snapshot to use'
+    description: 'Snapshot format/manual invalidation version.'
     required: false
     default: 'v1'
   volume_type:
-    description: 'Type of volume to use for the snapshot.'
+    description: 'EBS volume type. Supports standard, gp2, gp3, io1, io2, st1, and sc1.'
     required: false
     default: 'gp3'
   volume_iops:
-    description: 'IOPS to use for the volume.'
+    description: 'IOPS to use for the volume. Used only for gp3, io1, and io2.'
     required: false
     default: '3000'
   volume_throughput:
-    description: 'Throughput to use for the volume.'
+    description: 'Throughput to use for gp3 volumes in MiB/s. Must not exceed 0.25 MiB/s per provisioned IOPS.'
     required: false
     default: '750'
   volume_size:
@@ -32,7 +42,7 @@ inputs:
     required: false
     default: '40'
   volume_initialization_rate:
-    description: 'Initialization rate to use for the volume. Useful for very large volumes. 100 MB/s - 200 MB/s: $0.00240/GB, 201 MB/s - 300 MB/s	$0.00360/GB'
+    description: 'EBS provisioned volume initialization rate in MiB/s for volumes created from snapshots. Use 100-300; 0 disables this setting.'
     required: false
     default: '0' # 0 means "disabled"
   wait_for_completion:
@@ -40,6 +50,64 @@ inputs:
     required: false
     default: 'false'
   save:
-    description: 'Save the volume in the post step. When false, the volume is not saved.'
+    description: 'Save the volume in the post step. Use true, false, or auto.'
     required: false
     default: 'true'
+  save-if:
+    description: 'Policy used when save is auto. Supported value: git-paths-changed.'
+    required: false
+    default: 'always'
+  force-save:
+    description: 'Force snapshot creation even when save is auto and the smart policy would skip.'
+    required: false
+    default: 'false'
+  save-on-empty:
+    description: 'When save is auto, save if restored source metadata is missing.'
+    required: false
+    default: 'true'
+  wait-for-cleanup:
+    description: 'When snapshot creation is skipped or save=false, wait for detach and delete the volume. Snapshot saves always wait for detach before creating the snapshot.'
+    required: false
+    default: 'true'
+  save-policy-name:
+    description: 'Optional policy name written into snapshot source metadata.'
+    required: false
+  save-policy-version:
+    description: 'Optional policy version written into snapshot source metadata.'
+    required: false
+  save-marker-file:
+    description: 'Optional file path inside the snapshot that can contain save=false to skip snapshot creation.'
+    required: false
+  git-repository:
+    description: 'Git repository path to use for smart save path comparisons.'
+    required: false
+  git-head:
+    description: 'Current source SHA to store and compare for smart save.'
+    required: false
+  git-paths:
+    description: 'Newline-delimited Git pathspecs used when save-if is git-paths-changed.'
+    required: false
+  retention-days:
+    description: 'Tag snapshots with a delete-after epoch this many days in the future. 0 disables.'
+    required: false
+    default: '0'
+  keep-last-snapshots:
+    description: 'Best-effort prune older snapshots for the same key after save, keeping this many newest. 0 disables.'
+    required: false
+    default: '0'
+
+outputs:
+  restored:
+    description: 'true when an existing snapshot was restored, false when a blank volume was used.'
+  restored-from:
+    description: 'Restore source: branch, restore-key, default-branch, default-branch-restore-key, or empty.'
+  restored-branch:
+    description: 'Branch that supplied the restored snapshot.'
+  restored-snapshot-id:
+    description: 'EBS snapshot ID used for restore.'
+  volume-id:
+    description: 'EBS volume ID mounted by the action.'
+  restored-source-sha:
+    description: 'Source SHA recorded in the restored snapshot metadata.'
+  restored-source-ref:
+    description: 'Source ref recorded in the restored snapshot metadata.'
