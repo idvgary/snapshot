@@ -1,97 +1,39 @@
-# Local RunsOn Snapshot Action
+# RunsOn Snapshot Action
 
-This is a local fork of `runs-on/snapshot` for snapshotting directories on RunsOn self-hosted runners.
+GitHub Action for snapshotting directories on RunsOn self-hosted runners.
 
-The fork keeps the action generic, but adds snapshot stream keys and path-scoped identity so matrix jobs can use independent snapshots safely.
+This fork adds snapshot stream keys, path-scoped identity, fallback restore keys, smart save policies, and retention controls so matrix jobs can restore and save independent EBS snapshots safely.
 
 ## Usage
 
 ```yaml
-jobs:
-  cargo-build:
-    runs-on:
-      - runs-on=${{ github.run_id }}
-      - cpu=16
-      - family=m8azn
-      - image=ubuntu24-full-x64
+- name: Restore build-state snapshot
+  id: snapshot
+  uses: your-org/snapshot@v1
+  with:
+    path: /mnt/build-state
+    key: cargo-${{ runner.os }}-${{ runner.arch }}-release
+    volume_size: 20
+    save: auto
+    save-if: git-paths-changed
+    save-marker-file: /mnt/build-state/.runs-on-snapshot/save-marker
+    git-repository: /mnt/build-state/workspace
+    git-head: ${{ github.sha }}
+    git-paths: |
+      Cargo.lock
+      Cargo.toml
+      src/**
 
-    steps:
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore Cargo build-state snapshot
-        id: cargo-snapshot
-        uses: your-org/snapshot@v1
-        with:
-          path: /mnt/cargo-build-state
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-release
-          volume_size: 20
-          save: auto
-          save-if: git-paths-changed
-          save-policy-name: cargo-build-inputs
-          save-policy-version: v1
-          save-marker-file: /mnt/cargo-build-state/.runs-on-snapshot/save-marker
-          git-repository: /mnt/cargo-build-state/workspace
-          git-head: ${{ github.sha }}
-          git-paths: |
-            Cargo.lock
-            Cargo.toml
-            .cargo/**
-            build.rs
-            crates/**
-            src/**
-
-      - name: Checkout source into snapshot workspace
-        shell: bash
-        env:
-          SNAPSHOT_WORKSPACE: /mnt/cargo-build-state/workspace
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$SNAPSHOT_WORKSPACE"
-          git config --global --add safe.directory "$SNAPSHOT_WORKSPACE"
-          cd "$SNAPSHOT_WORKSPACE"
-
-          if [ ! -d .git ]; then
-            git init .
-            git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          else
-            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          fi
-
-          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
-          if [ "${GITHUB_REF#refs/heads/}" != "$GITHUB_REF" ]; then
-            fetch_ref="+${GITHUB_REF}:refs/remotes/origin/${GITHUB_REF_NAME}"
-          else
-            fetch_ref="$GITHUB_REF"
-          fi
-
-          git -c "http.https://github.com/.extraheader=$auth_header" fetch --force --prune --no-tags origin "$fetch_ref"
-
-          current_head="$(git rev-parse --verify HEAD 2>/dev/null || true)"
-          if [ "$current_head" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain --untracked-files=no)" ]; then
-            echo "HEAD already matches $GITHUB_SHA; skipping checkout to preserve file mtimes."
-            exit 0
-          fi
-
-          git -c advice.detachedHead=false checkout --detach --force "$GITHUB_SHA"
-
-      - name: Build with Cargo state on snapshot volume
-        shell: bash
-        env:
-          SNAPSHOT_ROOT: /mnt/cargo-build-state
-          CARGO_HOME: /mnt/cargo-build-state/cargo-home
-          CARGO_TARGET_DIR: /mnt/cargo-build-state/workspace/target
-        run: |
-          set -euo pipefail
-          mkdir -p "$CARGO_HOME"
-          cd /mnt/cargo-build-state/workspace
-          cargo build --release --locked
-
-          mkdir -p "$SNAPSHOT_ROOT/.runs-on-snapshot"
-          printf 'save=true\n' > "$SNAPSHOT_ROOT/.runs-on-snapshot/save-marker"
+- name: Build
+  run: |
+    set -euo pipefail
+    cd /mnt/build-state/workspace
+    cargo build --release --locked
+    mkdir -p /mnt/build-state/.runs-on-snapshot
+    printf 'save=true\n' > /mnt/build-state/.runs-on-snapshot/save-marker
 ```
+
+For a complete Cargo Lambda matrix workflow using RunsOn S3 cache, inline snapshot checkout, and per-function snapshot keys, see [`examples/cargo-lambda-matrix-s3-cache.yml`](examples/cargo-lambda-matrix-s3-cache.yml).
 
 ## Inputs
 
@@ -136,18 +78,7 @@ jobs:
 
 ## Snapshot Identity
 
-Snapshot lookup includes:
-
-```text
-repository
-branch
-key hash
-path hash
-version
-arch
-platform
-RunsOn stack tags
-```
+Snapshot lookup includes repository, branch, key hash, path hash, version, arch, platform, and RunsOn stack tags.
 
 The path hash prevents two different mount paths with the same key/version from restoring each other's snapshots.
 
@@ -171,27 +102,12 @@ The action saves by default when metadata is missing. This seeds new snapshot st
 
 If `save-marker-file` is configured, the workflow should write the marker only after the build output has been uploaded successfully. This lets the post step always unmount/detach while avoiding snapshots of failed or partial builds.
 
-The action skips saving when:
+The action skips saving when the restored source SHA already equals the current source SHA or no configured `git-paths` changed between the restored SHA and current SHA.
 
-```text
-restored source SHA already equals current source SHA
-no configured git-paths changed between restored SHA and current SHA
-```
+Before creating a snapshot, the action writes source metadata to `<snapshot-root>/.runs-on-snapshot/source.json`.
 
-Before creating a snapshot, the action writes:
+## Workspace Pattern
 
-```text
-<snapshot-root>/.runs-on-snapshot/source.json
-```
-
-That metadata becomes the base for the next restore.
-
-## Workspace Snapshot Pattern
-
-For source/build-state snapshots, do not mount directly over `${{ github.workspace }}`. Mount under `/mnt/...`, then checkout and build inside a child directory such as:
-
-```text
-/mnt/build-state/workspace
-```
+For source/build-state snapshots, do not mount directly over `${{ github.workspace }}`. Mount under `/mnt/...`, then checkout and build inside a child directory such as `/mnt/build-state/workspace`.
 
 This avoids busy workspace unmount failures and keeps the GitHub workspace available for local actions and artifact uploads.

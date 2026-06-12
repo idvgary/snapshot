@@ -1,0 +1,183 @@
+name: Cargo Lambda Matrix With Snapshot Build State
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - app/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: app-cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-lambdas:
+    if: github.actor != 'dependabot[bot]'
+    runs-on: runs-on=${{ github.run_id }}-${{ matrix.lambda.name }}/cpu=16/family=m8azn/image=ubuntu24-full-x64/extras=s3-cache
+
+    strategy:
+      fail-fast: false
+      matrix:
+        lambda:
+          - { name: api, binary: example_api }
+          - { name: worker, binary: example_worker }
+          - { name: callback, binary: example_callback }
+
+    env:
+      SNAPSHOT_ROOT: /mnt/example-cargo-snapshot
+      SNAPSHOT_WORKSPACE: /mnt/example-cargo-snapshot/workspace
+      SNAPSHOT_CARGO_HOME: /mnt/example-cargo-snapshot/cargo-home
+      SNAPSHOT_CARGO_TARGET_DIR: /mnt/example-cargo-snapshot/workspace/app/target
+      SNAPSHOT_XDG_CACHE_HOME: /mnt/example-cargo-snapshot/xdg-cache
+      SNAPSHOT_SAVE_MARKER: /mnt/example-cargo-snapshot/.runs-on-snapshot/save-marker
+      LAMBDA_ARTIFACT_PATH: ${{ github.workspace }}/artifacts/lambdas/${{ matrix.lambda.name }}
+
+    steps:
+      - name: Setup RunsOn Magic Cache
+        uses: runs-on/action@v2
+
+      - name: Checkout workflow files
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+
+      - name: Restore Cargo snapshot
+        id: cargo-snapshot
+        uses: your-org/snapshot@v1
+        with:
+          path: ${{ env.SNAPSHOT_ROOT }}
+          key: cargo-lambda-${{ matrix.lambda.name }}-release-arm64
+          volume_size: 5
+          retention-days: 10
+          keep-last-snapshots: 2
+          save: auto
+          save-if: git-paths-changed
+          wait-for-cleanup: false
+          save-policy-name: cargo-lambda-source
+          save-policy-version: v1
+          save-marker-file: ${{ env.SNAPSHOT_SAVE_MARKER }}
+          git-repository: ${{ env.SNAPSHOT_WORKSPACE }}
+          git-head: ${{ github.sha }}
+          git-paths: |
+            app/Cargo.lock
+            app/Cargo.toml
+            app/.cargo/**
+            app/bins/${{ matrix.lambda.binary }}/**
+            app/crates/**
+            app/libs/**
+
+      - name: Configure snapshot paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chown "$USER:$USER" "$SNAPSHOT_ROOT"
+          mkdir -p "$SNAPSHOT_WORKSPACE" "$SNAPSHOT_CARGO_HOME/bin" "$SNAPSHOT_XDG_CACHE_HOME"
+          sudo rm -f "$SNAPSHOT_SAVE_MARKER"
+          echo "$SNAPSHOT_CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure private Cargo registry
+        uses: example-org/private-cargo-registry-action@v1
+        env:
+          CARGO_HOME: ${{ env.SNAPSHOT_CARGO_HOME }}
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Checkout source into snapshot workspace
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$SNAPSHOT_WORKSPACE"
+          git config --global --add safe.directory "$SNAPSHOT_WORKSPACE"
+          cd "$SNAPSHOT_WORKSPACE"
+
+          if [ ! -d .git ]; then
+            git init .
+            git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          else
+            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          fi
+
+          git sparse-checkout init --cone
+          git sparse-checkout set --cone app .github
+
+          auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          if [ "${GITHUB_REF#refs/heads/}" != "$GITHUB_REF" ]; then
+            fetch_ref="+${GITHUB_REF}:refs/remotes/origin/${GITHUB_REF_NAME}"
+          else
+            fetch_ref="$GITHUB_REF"
+          fi
+
+          git -c "http.https://github.com/.extraheader=$auth_header" fetch --force --prune --no-tags origin "$fetch_ref"
+
+          current_head="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+          if [ "$current_head" = "$GITHUB_SHA" ] && [ -z "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "HEAD already matches $GITHUB_SHA; skipping checkout to preserve file mtimes."
+            exit 0
+          fi
+
+          git -c advice.detachedHead=false checkout --detach --force "$GITHUB_SHA"
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cargo-lambda
+        uses: taiki-e/install-action@v2
+        env:
+          CARGO_HOME: ${{ env.SNAPSHOT_CARGO_HOME }}
+        with:
+          tool: cargo-lambda@1.9.1
+
+      - name: Build Lambda binary
+        working-directory: ${{ env.SNAPSHOT_WORKSPACE }}/app
+        env:
+          CARGO_HOME: ${{ env.SNAPSHOT_CARGO_HOME }}
+          CARGO_TARGET_DIR: ${{ env.SNAPSHOT_CARGO_TARGET_DIR }}
+          CARGO_BUILD_JOBS: 32
+          XDG_CACHE_HOME: ${{ env.SNAPSHOT_XDG_CACHE_HOME }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMBDA_ARTIFACT_PATH"
+          cargo lambda build \
+            --lambda-dir "$LAMBDA_ARTIFACT_PATH" \
+            --bin "${{ matrix.lambda.binary }}" \
+            --flatten "${{ matrix.lambda.binary }}" \
+            --jobs 32 \
+            --release \
+            --arm64
+
+      - name: Scrub Cargo credentials before snapshot
+        if: always()
+        env:
+          CARGO_HOME: ${{ env.SNAPSHOT_CARGO_HOME }}
+        run: |
+          rm -f "$CARGO_HOME/credentials" "$CARGO_HOME/credentials.toml" "$CARGO_HOME/config.toml"
+
+      - name: Upload Lambda artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.lambda.name }}
+          path: ${{ env.LAMBDA_ARTIFACT_PATH }}
+          compression-level: 0
+
+      - name: Mark Lambda snapshot safe to save
+        run: |
+          sudo mkdir -p "$(dirname "$SNAPSHOT_SAVE_MARKER")"
+          printf 'save=true\n' | sudo tee "$SNAPSHOT_SAVE_MARKER" > /dev/null
